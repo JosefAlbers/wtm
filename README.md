@@ -6,11 +6,24 @@ This repository provides a fast and lightweight implementation of the [Whisper](
 
 ## Installation
 
+To install WTM on macOS, run:
+
 ```zsh
 brew install ffmpeg
 git clone https://github.com/JosefAlbers/whisper-turbo-mlx.git
 cd whisper-turbo-mlx
 pip install -e .
+```
+To install the CUDA backend on Linux, run:
+
+```zsh
+pip install -e .[cuda]
+```
+
+To install a CPU-only Linux package, run:
+
+```zsh
+pip install -e .[cpu]
 ```
 
 ## Quick Start

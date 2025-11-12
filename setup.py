@@ -18,6 +18,11 @@ setup(
     license="MIT",
     python_requires=">=3.12.3",
     install_requires=requirements,
+    extras_require={
+        'cuda': ['mlx[cuda]'], 
+        'cpu':  ['mlx[cpu]'],
+        'no_mlx': [],
+    },
     entry_points={
         "console_scripts": [
             "wtm = whisper_turbo:fire_main",
