@@ -6,19 +6,20 @@ import os
 import time
 from functools import lru_cache
 from subprocess import CalledProcessError, run
-
-import fire
 import librosa
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import tiktoken
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import snapshot_download
 
 class Tokenizer:
     def __init__(self):
         path_tok = 'multilingual.tiktoken'
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        path_tok = os.path.join(base_dir, 'multilingual.tiktoken')
         if not os.path.exists(path_tok):
+            from huggingface_hub import hf_hub_download
             path_tok = hf_hub_download(repo_id='JosefAlbers/whisper', filename=path_tok)
         with open(path_tok) as f:
             ranks = {base64.b64decode(token): int(rank) for token, rank in (line.split() for line in f if line)}
@@ -38,9 +39,14 @@ class Tokenizer:
 def load_audio(file, sr=16000):
     try:
         out = run(["ffmpeg", "-nostdin", "-threads", "0", "-i", file, "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), "-"], capture_output=True, check=True).stdout
-    except CalledProcessError as e:
-        raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
-    return mx.array(np.frombuffer(out, np.int16)).flatten().astype(mx.float32) / 32768.0
+        return mx.array(np.frombuffer(out, np.int16)).flatten().astype(mx.float32) / 32768.0
+    except Exception as e:
+        print(f"\033[31m[WARNING]\033[0m FFmpeg failed or not found. Falling back to librosa (decoding may be significantly slower)...: {e}")
+        try:
+            y, _ = librosa.load(file, sr=sr, mono=True)
+            return mx.array(y, dtype=mx.float32)
+        except Exception as le:
+            raise RuntimeError(f"Failed to load audio with both FFmpeg and librosa. Error: {le}") from le
 
 @lru_cache(maxsize=None)
 def mel_filters(n_mels):
@@ -94,6 +100,7 @@ def log_mel_spectrogram(audio, n_mels=128, padding=480000):
     log_spec = (log_spec + 4.0) / 4.0
     return log_spec
 
+@lru_cache(maxsize=None)
 def sinusoids(length, channels, max_timescale=10000):
     assert channels % 2 == 0
     log_timescale_increment = math.log(max_timescale) / (channels // 2 - 1)
@@ -213,22 +220,32 @@ class Transcriber(nn.Module):
         self.model = Whisper(cfg)
         self.tokenizer = Tokenizer()
         self.len_sot = 0
-    def __call__(self, path_audio, any_lang, quick):
+    def __call__(self, path_audio, multilingual, quick, timestamps):
         raw = log_mel_spectrogram(path_audio).astype(mx.float16)
-        sot = mx.array([[50258, 50360, 50365]]) if any_lang else mx.array([[50258, 50259, 50360, 50365]])
+        if multilingual:
+            sot = mx.array([[50258, 50360, 50365]]) if timestamps else mx.array([[50258, 50360, 50364, 50365]])
+        else:
+            sot = mx.array([[50258, 50259, 50360, 50365]]) if timestamps else mx.array([[50258, 50259, 50360, 50364, 50365]])
         self.len_sot = sot.shape[-1]
-        txt = self.parallel(raw, sot) if quick else self.recurrent(raw, sot)
-        return txt
+        self.timestamps = timestamps
+        txt, segs = self.parallel(raw, sot) if quick else self.recurrent(raw, sot)
+        return txt, segs
     def recurrent(self, raw, sot):
-        new_tok, i = mx.zeros((1,0), dtype=mx.int32), 0
+        text_parts, all_segs, i = [], [], 0
         while i+3000 < len(raw):
             piece = self.step(raw[i:i+3000][None], sot)
             arg_hop = mx.argmax(piece).item()
             hop = (piece[:,arg_hop].astype(mx.int32).item()-50365)*2
-            new_tok = mx.concatenate([new_tok, piece[:,:arg_hop]], axis=-1)
+            toks = piece[:,:arg_hop].astype(mx.int32).tolist()[0]
+            if self.timestamps:
+                segs = self._decode_with_timestamps(toks, offset=i/100.0)
+                all_segs.extend(segs)
+                text_parts.extend(f"[{s:.2f}s -> {e:.2f}s]  {t}" if e else f"[{s:.2f}s]  {t}" for s,e,t in segs)
+            else:
+                text_parts.append(self.tokenizer.decode([t for t in toks if t < 50257])[0])
             i += hop if hop > 0 else 3000
-        new_tok = [i for i in new_tok.astype(mx.int32).tolist()[0] if i < 50257]
-        return self.tokenizer.decode(new_tok)[0]
+        txt = "\n".join(text_parts) if self.timestamps else "".join(text_parts)
+        return txt, (all_segs if self.timestamps else None)
     def parallel(self, raw, sot):
         raw = raw[:(raw.shape[0]//3000)*3000].reshape(-1, 3000, 128)
         assert raw.shape[0] < 360
@@ -236,8 +253,34 @@ class Transcriber(nn.Module):
         new_tok = self.step(raw, sot)
         arg_hop = mx.argmax(new_tok, axis=-1).tolist()
         new_tok = [i[:a] for i,a in zip(new_tok.astype(mx.int32).tolist(),arg_hop)]
-        new_tok = [i for i in sum(new_tok, []) if i < 50257]
-        return self.tokenizer.decode(new_tok)[0]
+        if self.timestamps:
+            all_segs = []
+            for chunk_idx, toks in enumerate(new_tok):
+                chunk_offset = chunk_idx * 30.0
+                segs = self._decode_with_timestamps(toks, offset=chunk_offset)
+                all_segs.extend(segs)
+            txt = "\n".join(f"[{s:.2f}s -> {e:.2f}s]  {t}" if e else f"[{s:.2f}s]  {t}" for s,e,t in all_segs)
+            return txt, all_segs
+        flat = sum(new_tok, [])
+        return self.tokenizer.decode([t for t in flat if t < 50257])[0], None
+    def _decode_with_timestamps(self, toks, offset=0.0):
+        segments, current_text, current_start = [], [], offset
+        for t in toks:
+            if t >= 50365:
+                ts = (t - 50365) * 0.02 + offset
+                if current_text:
+                    text = self.tokenizer.decode(current_text)[0].strip()
+                    if text:
+                        segments.append((current_start, ts, text))
+                    current_text = []
+                current_start = ts
+            elif t < 50257:
+                current_text.append(t)
+        if current_text:
+            text = self.tokenizer.decode(current_text)[0].strip()
+            if text:
+                segments.append((current_start, None, text))
+        return segments
     def step(self, mel, txt):
         mel = self.model.encode(mel)
         kv_cache = None
@@ -254,7 +297,7 @@ class Transcriber(nn.Module):
                 break
         return new_tok
 
-def transcribe(path_audio=None, any_lang=False, quick=False):
+def transcribe(path_audio=None, multilingual=False, quick=False, timestamps=False):
     if path_audio is None:
         return benchmark()
     path_hf = snapshot_download(repo_id='openai/whisper-large-v3-turbo', allow_patterns=["config.json", "model.safetensors"])
@@ -265,47 +308,49 @@ def transcribe(path_audio=None, any_lang=False, quick=False):
     model.load_weights(weights, strict=False)
     model.eval()
     mx.eval(model)
-    return model(path_audio=path_audio, any_lang=any_lang, quick=quick)
+    txt, segs = model(path_audio=path_audio, multilingual=multilingual, quick=quick, timestamps=timestamps)
+    return txt, segs
 
 def benchmark():
     path_hf = snapshot_download(repo_id='JosefAlbers/exurb1a', allow_patterns=["*.mp3"])
     tics = {}
     for path_audio in sorted(glob.glob(f"{path_hf}/*.mp3")):
-        for any_lang in [True, False]:
+        for multilingual in [True, False]:
             for quick in [True, False]:
                 tic = time.perf_counter()
-                arg = f'{path_audio.split('/')[-1]} {any_lang=} {quick=}'
+                arg = f'{path_audio.split('/')[-1]} {multilingual=} {quick=}'
                 print(f'--- {arg=}')
-                print(transcribe(path_audio=path_audio, any_lang=any_lang, quick=quick))
+                print(transcribe(path_audio=path_audio, multilingual=multilingual, quick=quick)[0])
                 tic = f'{(time.perf_counter() - tic):.2f}'
                 print(f'{tic=}')
                 tics[arg] = tic
     return tics
 
-def fire_main():
-    fire.Fire(transcribe)
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Whisper Transcriber using MLX")
+    parser.add_argument("path_audio", nargs="?", type=str, default=None, 
+                        help="Path to the audio file. If omitted, runs the benchmark.")
+    parser.add_argument("-m", "--multilingual", action="store_true", 
+                        help="Enable multilingual transcription.")
+    parser.add_argument("-q", "--quick", action="store_true", 
+                        help="Use parallel processing for quicker transcription.")
+    parser.add_argument("-t", "--timestamps", action="store_true", 
+                        help="Include timestamps in the output.")
+    args = parser.parse_args()
+    result = transcribe(
+        path_audio=args.path_audio,
+        multilingual=args.multilingual,
+        quick=args.quick,
+        timestamps=args.timestamps
+    )
+    if isinstance(result, tuple) and len(result) == 2 and args.path_audio:
+        txt, segs = result
+        print(txt)
+        if segs:
+            print("\nSegments:", segs)
+    else:
+        print(result)
 
 if __name__ == '__main__':
-    fire.Fire(transcribe)
-
-# benchmarks:
-# 0_test.mp3 any_lang=True quick=True:    0.85
-# 0_test.mp3 any_lang=True quick=False:   0.75
-# 0_test.mp3 any_lang=False quick=True:   0.78
-# 0_test.mp3 any_lang=False quick=False:  0.77
-# 1_alive.mp3 any_lang=True quick=True:   7.10
-# 1_alive.mp3 any_lang=True quick=False:  7.98
-# 1_alive.mp3 any_lang=False quick=True:  6.57
-# 1_alive.mp3 any_lang=False quick=False: 7.98
-# 2_make.mp3 any_lang=True quick=True:    7.30
-# 2_make.mp3 any_lang=True quick=False:   13.30
-# 2_make.mp3 any_lang=False quick=True:   6.26
-# 2_make.mp3 any_lang=False quick=False:  11.10
-# 3_try.mp3 any_lang=True quick=True:     8.62
-# 3_try.mp3 any_lang=True quick=False:    14.79
-# 3_try.mp3 any_lang=False quick=True:    7.87
-# 3_try.mp3 any_lang=False quick=False:   15.21
-# 4_never.mp3 any_lang=True quick=True:   11.70
-# 4_never.mp3 any_lang=True quick=False:  17.70
-# 4_never.mp3 any_lang=False quick=True:  10.67
-# 4_never.mp3 any_lang=False quick=False: 19.48
+    main()

@@ -1,4 +1,4 @@
-from setuptools import find_packages, setup
+from setuptools import setup, find_packages
 
 with open("requirements.txt") as f:
     requirements = [l.strip() for l in f.readlines()]
@@ -6,9 +6,10 @@ with open("requirements.txt") as f:
 setup(
     name='whisper-turbo-mlx',
     url='https://github.com/JosefAlbers/whisper-turbo-mlx',
-    py_modules=['whisper_turbo'],
+    py_modules=['whisper_turbo',],
     packages=find_packages(),
-    version='0.0.2-alpha',
+    package_data={'whisper_turbo': ['multilingual.tiktoken'],},
+    version='0.0.3',
     readme="README.md",
     author_email="albersj66@gmail.com",
     description="Whisper Turbo in MLX",
@@ -25,7 +26,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "wtm = whisper_turbo:fire_main",
+            "wtm = whisper_turbo:main",
         ],
     },
 )
